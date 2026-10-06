@@ -1,4 +1,5 @@
 import os
+import mimetypes
 import json
 import random
 import sqlite3
@@ -1654,6 +1655,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
+
+        # Serve frontend files from the same Render service
+        if path == "" or not path.startswith("/api/"):
+            relative = path.lstrip("/") or "index.html"
+            file_path = os.path.realpath(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "frontend",
+                    relative
+                )
+            )
+            frontend_dir = os.path.realpath(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "frontend"
+                )
+            )
+
+            if file_path.startswith(frontend_dir + os.sep) and os.path.isfile(file_path):
+                try:
+                    with open(file_path, "rb") as f:
+                        content = f.read()
+
+                    content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+
+                except Exception as e:
+                    self.send_json({"error": str(e)}, 500)
+                    return
+
+            self.send_json({"error": "Frontend file not found"}, 404)
+            return
 
         if path == "/api/heroes":
             self.send_json(HEROES)
