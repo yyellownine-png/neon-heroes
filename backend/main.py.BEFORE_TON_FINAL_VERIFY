@@ -1,0 +1,1617 @@
+import json
+import random
+import sqlite3
+import requests
+import time
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+BASE_DIR = Path(__file__).resolve().parent
+DB = BASE_DIR / "game.db"
+
+HEROES = [
+    {
+        "id": 1,
+        "name": "Viktor",
+        "rarity": "Common",
+        "class": "Tank",
+        "power": 920,
+        "hp": 1400,
+        "atk": 180,
+        "def": 240,
+        "title": "The Iron Guardian",
+        "ability": "IRON WALL",
+        "image": "assets/viktor.jpg"
+    },
+    {
+        "id": 2,
+        "name": "Nyx",
+        "rarity": "Rare",
+        "class": "Assassin",
+        "power": 1350,
+        "hp": 950,
+        "atk": 320,
+        "def": 120,
+        "title": "Shadow of the Night",
+        "ability": "NIGHT STRIKE",
+        "image": "assets/nyx.jpg"
+    },
+    {
+        "id": 3,
+        "name": "Mara",
+        "rarity": "Rare",
+        "class": "Mage",
+        "power": 1480,
+        "hp": 1050,
+        "atk": 390,
+        "def": 100,
+        "title": "Neon Witch",
+        "ability": "VOID BLAST",
+        "image": "assets/mara.jpg"
+    },
+    {
+        "id": 4,
+        "name": "Raven",
+        "rarity": "Epic",
+        "class": "Assassin",
+        "power": 2100,
+        "hp": 1250,
+        "atk": 560,
+        "def": 180,
+        "title": "Cyber Phantom",
+        "ability": "RAVEN FURY",
+        "image": "assets/raven.jpg"
+    },
+    {
+        "id": 5,
+        "name": "Kael",
+        "rarity": "Epic",
+        "class": "Warrior",
+        "power": 2250,
+        "hp": 1850,
+        "atk": 480,
+        "def": 360,
+        "title": "Last Vanguard",
+        "ability": "OVERDRIVE",
+        "image": "assets/kael.jpg"
+    },
+    {
+        "id": 6,
+        "name": "Sable",
+        "rarity": "Legendary",
+        "class": "Assassin",
+        "power": 3200,
+        "hp": 1500,
+        "atk": 780,
+        "def": 240,
+        "title": "Queen of Shadows",
+        "ability": "VOID EXECUTION",
+        "image": "assets/sable.jpg"
+    },
+    {
+        "id": 7,
+        "name": "Iris",
+        "rarity": "Legendary",
+        "class": "Support",
+        "power": 3050,
+        "hp": 2200,
+        "atk": 520,
+        "def": 420,
+        "title": "Neon Oracle",
+        "ability": "STARLIGHT",
+        "image": "assets/iris.jpg"
+    },
+    {
+        "id": 8,
+        "name": "Jax",
+        "rarity": "Common",
+        "class": "Warrior",
+        "power": 980,
+        "hp": 1350,
+        "atk": 210,
+        "def": 220,
+        "title": "Street Fighter",
+        "ability": "POWER PUNCH",
+        "image": "assets/jax.jpg"
+    }
+]
+
+CHESTS = {
+    "Basic": 3,
+    "Rare": 7,
+    "Epic": 15,
+    "Legendary": 30
+}
+
+
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            uid INTEGER PRIMARY KEY,
+            gems INTEGER DEFAULT 100,
+            coins INTEGER DEFAULT 5000,
+            energy INTEGER DEFAULT 30,
+            level INTEGER DEFAULT 1,
+            xp INTEGER DEFAULT 0,
+            gram INTEGER DEFAULT 0,
+            chest_tickets INTEGER DEFAULT 0,
+            hero_fragments INTEGER DEFAULT 0,
+            energy_updated INTEGER DEFAULT 0,
+            energy_purchases_today INTEGER DEFAULT 0,
+            energy_purchase_day TEXT DEFAULT ''
+        )
+    """)
+
+    for column, definition in [
+        ("gram", "INTEGER DEFAULT 0"),
+        ("chest_tickets", "INTEGER DEFAULT 0"),
+        ("hero_fragments", "INTEGER DEFAULT 0"),
+        ("energy_updated", "INTEGER DEFAULT 0"),
+        ("energy_purchases_today", "INTEGER DEFAULT 0"),
+        ("energy_purchase_day", "TEXT DEFAULT ''")
+    ]:
+        try:
+            c.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS shop_purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid INTEGER NOT NULL,
+            product_id TEXT NOT NULL,
+            gram_spent INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid INTEGER NOT NULL,
+            network TEXT NOT NULL,
+            gram_amount INTEGER NOT NULL,
+            payment_amount TEXT NOT NULL,
+            address TEXT NOT NULL,
+            tx_hash TEXT DEFAULT '',
+            status TEXT DEFAULT 'PENDING',
+            created_at INTEGER NOT NULL,
+            paid_at INTEGER DEFAULT 0
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS collection (
+            uid INTEGER,
+            hero_id INTEGER,
+            count INTEGER DEFAULT 1,
+            PRIMARY KEY(uid, hero_id)
+        )
+    """)
+
+    c.commit()
+    return c
+
+
+def ensure_user(uid):
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    if not user:
+        now = int(time.time())
+        c.execute("""
+            INSERT INTO users(
+                uid,gems,coins,energy,level,xp,gram,
+                chest_tickets,hero_fragments,energy_updated
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            uid, 100, 5000, 30, 1, 0, 0,
+            0, 0, now
+        ))
+        c.commit()
+
+    c.close()
+
+
+def get_state(uid):
+    ensure_user(uid)
+
+    # Passive Energy regeneration.
+    restore_energy(uid)
+
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    collection = c.execute(
+        "SELECT hero_id,count FROM collection WHERE uid=?",
+        (uid,)
+    ).fetchall()
+
+    owned = []
+
+    for row in collection:
+        owned.append({
+            "hero_id": row["hero_id"],
+            "count": row["count"]
+        })
+
+    result = {
+        "uid": uid,
+        "gems": user["gems"],
+        "coins": user["coins"],
+        "energy": user["energy"],
+        "max_energy": 30,
+        "gram": user["gram"],
+        "chest_tickets": user["chest_tickets"],
+        "hero_fragments": user["hero_fragments"],
+        "energy_updated": user["energy_updated"],
+        "level": user["level"],
+        "xp": user["xp"],
+        "owned": owned
+    }
+
+    c.close()
+
+    return result
+
+
+def open_chest(uid, chest):
+    if chest not in CHESTS:
+        return {"error": "Unknown chest"}
+
+    ensure_user(uid)
+
+    cost = CHESTS[chest]
+
+    c = db()
+
+    user = c.execute(
+        "SELECT gems FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    gems = user["gems"]
+
+    if gems < cost:
+        c.close()
+        return {"error": "Not enough gems"}
+
+    odds = {
+        "Basic": ["Common", "Common", "Rare"],
+        "Rare": ["Common", "Rare", "Rare", "Epic"],
+        "Epic": ["Rare", "Epic", "Epic", "Legendary"],
+        "Legendary": ["Epic", "Legendary", "Legendary", "Limited Legendary"]
+    }
+
+    rarity = random.choice(odds[chest])
+
+    pool = [
+        h for h in HEROES
+        if h["rarity"] == rarity
+    ]
+
+    if not pool:
+        pool = [
+            h for h in HEROES
+            if h["rarity"] == "Legendary"
+        ]
+
+    hero = random.choice(pool)
+
+    new_gems = gems - cost
+
+    c.execute(
+        "UPDATE users SET gems=? WHERE uid=?",
+        (new_gems, uid)
+    )
+
+    old = c.execute("""
+        SELECT count
+        FROM collection
+        WHERE uid=? AND hero_id=?
+    """, (uid, hero["id"])).fetchone()
+
+    if old:
+        c.execute("""
+            UPDATE collection
+            SET count=count+1
+            WHERE uid=? AND hero_id=?
+        """, (uid, hero["id"]))
+    else:
+        c.execute("""
+            INSERT INTO collection(uid,hero_id,count)
+            VALUES(?,?,1)
+        """, (uid, hero["id"], 1))
+
+    c.commit()
+    c.close()
+
+    return {
+        "hero": hero,
+        "rarity": rarity,
+        "gems": new_gems
+    }
+
+
+
+# ==========================================
+# NEON HEROES SHOP
+# ==========================================
+
+
+# ==========================================
+# REAL GRAM PAYMENTS
+# ==========================================
+
+PAYMENT_ADDRESSES = {
+    "TON": "UQAZ3funj_qRm0ZN6N6KK35zSL4gYPkxRjTX_QsOKi_8oRBw",
+    "USDT_BEP20": "0xa3CD09200F8A0e8dBd27e0dE56a1B1CF9b14EbD2"
+}
+
+GRAM_PACKAGES = {
+    1:  {"ton": "1",   "usdt": "1"},
+    5:  {"ton": "5",   "usdt": "5"},
+    10: {"ton": "10",  "usdt": "10"},
+    20: {"ton": "20",  "usdt": "20"},
+    50: {"ton": "50",  "usdt": "50"},
+    100: {"ton": "100", "usdt": "100"}
+}
+
+
+def create_payment_order(uid, network, gram_amount):
+
+    ensure_user(uid)
+
+    network = str(network).upper()
+    gram_amount = int(gram_amount)
+
+    if network not in PAYMENT_ADDRESSES:
+        return {"error": "Unsupported payment network"}
+
+    package = GRAM_PACKAGES.get(gram_amount)
+
+    if not package:
+        return {"error": "Invalid GRAM package"}
+
+    payment_amount = package[
+        "ton" if network == "TON" else "usdt"
+    ]
+
+    c = db()
+
+    now = int(time.time())
+
+    c.execute(
+        """
+        INSERT INTO payment_orders(
+            uid,
+            network,
+            gram_amount,
+            payment_amount,
+            address,
+            status,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            uid,
+            network,
+            gram_amount,
+            payment_amount,
+            PAYMENT_ADDRESSES[network],
+            "PENDING",
+            now
+        )
+    )
+
+    order_id = c.execute(
+        "SELECT last_insert_rowid()"
+    ).fetchone()[0]
+
+    c.commit()
+    c.close()
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "network": network,
+        "gram": gram_amount,
+        "amount": payment_amount,
+        "address": PAYMENT_ADDRESSES[network],
+        "status": "PENDING"
+    }
+
+
+def get_payment_order(uid, order_id):
+
+    c = db()
+
+    order = c.execute(
+        """
+        SELECT *
+        FROM payment_orders
+        WHERE id=? AND uid=?
+        """,
+        (order_id, uid)
+    ).fetchone()
+
+    c.close()
+
+    if not order:
+        return {
+            "error": "Order not found"
+        }
+
+    return {
+        "id": order["id"],
+        "network": order["network"],
+        "gram": order["gram_amount"],
+        "amount": order["payment_amount"],
+        "address": order["address"],
+        "tx_hash": order["tx_hash"],
+        "status": order["status"],
+        "created_at": order["created_at"],
+        "paid_at": order["paid_at"]
+    }
+
+
+
+# ==========================================
+# BLOCKCHAIN PAYMENT VERIFICATION
+# ==========================================
+
+TONAPI_URL = "https://tonapi.io"
+
+# Для публичного API ключ необязателен,
+# но позже можно добавить TONAPI_API_KEY.
+TONAPI_API_KEY = ""
+
+
+def verify_ton_transaction(order_id, tx_hash):
+
+    c = db()
+
+    order = c.execute(
+        """
+        SELECT *
+        FROM payment_orders
+        WHERE id=? AND network='TON'
+        """,
+        (order_id,)
+    ).fetchone()
+
+    c.close()
+
+    if not order:
+        return {"error": "TON order not found"}
+
+    if order["status"] == "PAID":
+        return {
+            "success": True,
+            "status": "PAID",
+            "already_processed": True
+        }
+
+    tx_hash = str(tx_hash).strip()
+
+    if not tx_hash:
+        return {
+            "error": "Transaction hash required"
+        }
+
+    headers = {}
+
+    if TONAPI_API_KEY:
+        headers["Authorization"] = (
+            "Bearer " + TONAPI_API_KEY
+        )
+
+    # Получаем транзакцию по hash.
+    try:
+        response = requests.get(
+            TONAPI_URL +
+            "/v2/blockchain/transactions/" +
+            tx_hash,
+            headers=headers,
+            timeout=15
+        )
+    except Exception as e:
+        return {
+            "error": "TONAPI connection failed",
+            "details": str(e)
+        }
+
+    if response.status_code != 200:
+        return {
+            "error": "TON transaction not found",
+            "http_status": response.status_code
+        }
+
+    try:
+        tx = response.json()
+    except Exception:
+        return {
+            "error": "Invalid TONAPI response"
+        }
+
+    # На этом этапе НЕ начисляем GRAM автоматически.
+    #
+    # Нам нужно дополнительно убедиться,
+    # что transaction действительно:
+    #
+    # 1. пришла на наш TON address
+    # 2. имеет нужную сумму
+    # 3. является успешной
+    #
+    # Структура TONAPI может содержать несколько
+    # сообщений/действий, поэтому ниже возвращаем
+    # данные для следующего валидатора.
+
+    return {
+        "success": True,
+        "verified": False,
+        "status": "FOUND",
+        "order_id": order_id,
+        "transaction": tx
+    }
+
+
+def confirm_payment(order_id, tx_hash):
+
+    """
+    Внутренняя функция.
+    НЕ вызывается клиентом напрямую.
+
+    В будущем сюда передаём только транзакцию,
+    которую backend уже проверил в блокчейне.
+    """
+
+    tx_hash = str(tx_hash).strip()
+
+    if not tx_hash:
+        return {"error": "Missing transaction hash"}
+
+    c = db()
+
+    try:
+        c.execute("BEGIN IMMEDIATE")
+
+        order = c.execute(
+            """
+            SELECT *
+            FROM payment_orders
+            WHERE id=?
+            """,
+            (order_id,)
+        ).fetchone()
+
+        if not order:
+            c.rollback()
+            return {"error": "Order not found"}
+
+        if order["status"] == "PAID":
+            c.rollback()
+            return {
+                "success": True,
+                "status": "PAID",
+                "already_processed": True
+            }
+
+        # Одна транзакция не может быть использована дважды.
+        used = c.execute(
+            """
+            SELECT id
+            FROM payment_orders
+            WHERE tx_hash=? AND status='PAID'
+            LIMIT 1
+            """,
+            (tx_hash,)
+        ).fetchone()
+
+        if used:
+            c.rollback()
+            return {
+                "error": "Transaction already used"
+            }
+
+        user = c.execute(
+            "SELECT gram FROM users WHERE uid=?",
+            (order["uid"],)
+        ).fetchone()
+
+        if not user:
+            c.rollback()
+            return {"error": "User not found"}
+
+        new_gram = (
+            int(user["gram"] or 0)
+            + int(order["gram_amount"])
+        )
+
+        now = int(time.time())
+
+        c.execute(
+            """
+            UPDATE users
+            SET gram=?
+            WHERE uid=?
+            """,
+            (new_gram, order["uid"])
+        )
+
+        c.execute(
+            """
+            UPDATE payment_orders
+            SET tx_hash=?,
+                status='PAID',
+                paid_at=?
+            WHERE id=?
+            """,
+            (tx_hash, now, order_id)
+        )
+
+        c.commit()
+
+        return {
+            "success": True,
+            "status": "PAID",
+            "gram": new_gram
+        }
+
+    except Exception as e:
+        c.rollback()
+        return {
+            "error": str(e)
+        }
+
+    finally:
+        c.close()
+
+
+SHOP_PRODUCTS = {
+    # Gems
+    "gems_1": {
+        "type": "gems",
+        "name": "100 Gems",
+        "gram": 1,
+        "amount": 100
+    },
+    "gems_5": {
+        "type": "gems",
+        "name": "550 Gems",
+        "gram": 5,
+        "amount": 550
+    },
+    "gems_10": {
+        "type": "gems",
+        "name": "1200 Gems",
+        "gram": 10,
+        "amount": 1200
+    },
+    "gems_20": {
+        "type": "gems",
+        "name": "2800 Gems",
+        "gram": 20,
+        "amount": 2800
+    },
+    "gems_50": {
+        "type": "gems",
+        "name": "7500 Gems",
+        "gram": 50,
+        "amount": 7500
+    },
+    "gems_100": {
+        "type": "gems",
+        "name": "16000 Gems",
+        "gram": 100,
+        "amount": 16000
+    },
+
+    # Energy
+    "energy_10": {
+        "type": "energy",
+        "name": "+10 Energy",
+        "gram": 2,
+        "amount": 10
+    },
+    "energy_30": {
+        "type": "energy",
+        "name": "+30 Energy",
+        "gram": 5,
+        "amount": 30
+    },
+    "energy_full": {
+        "type": "energy_full",
+        "name": "Full Energy",
+        "gram": 3
+    },
+
+    # Chests
+    "chest_basic": {
+        "type": "chest",
+        "name": "Basic Chest",
+        "gram": 3,
+        "chest": "Basic"
+    },
+    "chest_rare": {
+        "type": "chest",
+        "name": "Rare Chest",
+        "gram": 7,
+        "chest": "Rare"
+    },
+    "chest_epic": {
+        "type": "chest",
+        "name": "Epic Chest",
+        "gram": 15,
+        "chest": "Epic"
+    },
+    "chest_legendary": {
+        "type": "chest",
+        "name": "Legendary Chest",
+        "gram": 30,
+        "chest": "Legendary"
+    },
+
+    # Premium
+    "starter": {
+        "type": "starter",
+        "name": "Starter Pack",
+        "gram": 5
+    },
+    "weekly": {
+        "type": "weekly",
+        "name": "Weekly Pack",
+        "gram": 15
+    },
+    "premium_pass": {
+        "type": "pass",
+        "name": "Premium Pass",
+        "gram": 25
+    },
+    "season_pack": {
+        "type": "season",
+        "name": "Season Pack",
+        "gram": 50
+    }
+}
+
+
+def get_shop():
+    result = []
+
+    for product_id, product in SHOP_PRODUCTS.items():
+        item = dict(product)
+        item["id"] = product_id
+        result.append(item)
+
+    return result
+
+
+def restore_energy(uid):
+    """
+    Passive regeneration:
+    +1 Energy every 6 minutes.
+    Maximum = 30.
+    """
+    ensure_user(uid)
+
+    c = db()
+
+    user = c.execute(
+        "SELECT energy, energy_updated FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    if not user:
+        c.close()
+        return 0
+
+    now = int(time.time())
+    current = int(user["energy"] or 0)
+    updated = int(user["energy_updated"] or now)
+
+    if updated <= 0:
+        updated = now
+
+    elapsed = max(0, now - updated)
+    restored = elapsed // 360
+
+    if restored > 0 and current < 30:
+        new_energy = min(30, current + restored)
+
+        # If energy became full, timestamp becomes now.
+        # Otherwise preserve the remainder of the 6-minute timer.
+        if new_energy >= 30:
+            new_updated = now
+        else:
+            new_updated = updated + restored * 360
+
+        c.execute(
+            """
+            UPDATE users
+            SET energy=?, energy_updated=?
+            WHERE uid=?
+            """,
+            (new_energy, new_updated, uid)
+        )
+
+        c.commit()
+        current = new_energy
+
+    elif current >= 30:
+        c.execute(
+            "UPDATE users SET energy_updated=? WHERE uid=?",
+            (now, uid)
+        )
+        c.commit()
+
+    c.close()
+
+    return current
+
+
+def purchase_product(uid, product_id):
+    """
+    Server-authoritative in-game purchase.
+    GRAM is consumed first and the reward is granted
+    inside the same SQLite transaction.
+    """
+
+    ensure_user(uid)
+
+    product = SHOP_PRODUCTS.get(product_id)
+
+    if not product:
+        return {"error": "Unknown product"}
+
+    c = db()
+
+    try:
+        c.execute("BEGIN IMMEDIATE")
+
+        user = c.execute(
+            "SELECT * FROM users WHERE uid=?",
+            (uid,)
+        ).fetchone()
+
+        if not user:
+            c.rollback()
+            return {"error": "User not found"}
+
+        gram = int(user["gram"] or 0)
+        price = int(product["gram"])
+
+        if gram < price:
+            c.rollback()
+            return {
+                "error": "Not enough GRAM",
+                "gram": gram,
+                "required": price
+            }
+
+        # Always calculate current Energy before purchase.
+        energy = restore_energy(uid)
+
+        # restore_energy opens its own DB connection, so refresh user.
+        user = c.execute(
+            "SELECT * FROM users WHERE uid=?",
+            (uid,)
+        ).fetchone()
+
+        gram = int(user["gram"] or 0)
+        new_gram = gram - price
+
+        # ==================================
+        # GEMS
+        # ==================================
+        if product["type"] == "gems":
+            new_gems = int(user["gems"] or 0) + product["amount"]
+
+            c.execute(
+                "UPDATE users SET gram=?, gems=? WHERE uid=?",
+                (new_gram, new_gems, uid)
+            )
+
+            reward = {
+                "gems": product["amount"]
+            }
+
+        # ==================================
+        # ENERGY
+        # ==================================
+        elif product["type"] == "energy":
+            new_energy = min(
+                30,
+                int(user["energy"] or 0) + product["amount"]
+            )
+
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?, energy=?, energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, new_energy, int(time.time()), uid)
+            )
+
+            reward = {
+                "energy": new_energy
+            }
+
+        elif product["type"] == "energy_full":
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?, energy=30, energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, int(time.time()), uid)
+            )
+
+            reward = {
+                "energy": 30
+            }
+
+        # ==================================
+        # CHEST
+        # ==================================
+        elif product["type"] == "chest":
+            chest = product["chest"]
+
+            odds = {
+                "Basic": ["Common", "Common", "Rare"],
+                "Rare": ["Common", "Rare", "Rare", "Epic"],
+                "Epic": ["Rare", "Epic", "Epic", "Legendary"],
+                "Legendary": [
+                    "Epic",
+                    "Legendary",
+                    "Legendary",
+                    "Limited Legendary"
+                ]
+            }
+
+            rarity = random.choice(odds[chest])
+
+            pool = [
+                h for h in HEROES
+                if h["rarity"] == rarity
+            ]
+
+            if not pool:
+                pool = [
+                    h for h in HEROES
+                    if h["rarity"] == "Legendary"
+                ]
+
+            hero = random.choice(pool)
+
+            old = c.execute(
+                """
+                SELECT count FROM collection
+                WHERE uid=? AND hero_id=?
+                """,
+                (uid, hero["id"])
+            ).fetchone()
+
+            if old:
+                c.execute(
+                    """
+                    UPDATE collection
+                    SET count=count+1
+                    WHERE uid=? AND hero_id=?
+                    """,
+                    (uid, hero["id"])
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO collection(uid,hero_id,count)
+                    VALUES(?,?,1)
+                    """,
+                    (uid, hero["id"], 1)
+                )
+
+            c.execute(
+                "UPDATE users SET gram=? WHERE uid=?",
+                (new_gram, uid)
+            )
+
+            reward = {
+                "hero": hero,
+                "rarity": rarity,
+                "chest": chest
+            }
+
+        # ==================================
+        # STARTER
+        # ==================================
+        elif product["type"] == "starter":
+            # One-time purchase check.
+            marker = c.execute(
+                """
+                SELECT 1 FROM shop_purchases
+                WHERE uid=? AND product_id='starter'
+                LIMIT 1
+                """,
+                (uid,)
+            ).fetchone()
+
+            if marker:
+                c.rollback()
+                return {"error": "Starter pack already purchased"}
+
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?,
+                    gems=gems+500,
+                    coins=coins+5000,
+                    energy=30,
+                    energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, int(time.time()), uid)
+            )
+
+            reward = {
+                "gems": 500,
+                "coins": 5000,
+                "energy": 30
+            }
+
+        # ==================================
+        # WEEKLY
+        # ==================================
+        elif product["type"] == "weekly":
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?,
+                    gems=gems+1500,
+                    coins=coins+15000,
+                    energy=30,
+                    energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, int(time.time()), uid)
+            )
+
+            reward = {
+                "gems": 1500,
+                "coins": 15000,
+                "energy": 30
+            }
+
+        # ==================================
+        # PREMIUM PASS
+        # ==================================
+        elif product["type"] == "pass":
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?,
+                    gems=gems+3000,
+                    coins=coins+30000,
+                    energy=30,
+                    energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, int(time.time()), uid)
+            )
+
+            reward = {
+                "gems": 3000,
+                "coins": 30000,
+                "energy": 30,
+                "premium_pass": True
+            }
+
+        # ==================================
+        # SEASON PACK
+        # ==================================
+        elif product["type"] == "season":
+            c.execute(
+                """
+                UPDATE users
+                SET gram=?,
+                    gems=gems+8000,
+                    coins=coins+100000,
+                    energy=30,
+                    energy_updated=?
+                WHERE uid=?
+                """,
+                (new_gram, int(time.time()), uid)
+            )
+
+            reward = {
+                "gems": 8000,
+                "coins": 100000,
+                "energy": 30
+            }
+
+        else:
+            c.rollback()
+            return {"error": "Unsupported product"}
+
+        # Transaction history.
+        c.execute(
+            """
+            INSERT INTO shop_purchases(uid,product_id,gram_spent,created_at)
+            VALUES(?,?,?,?)
+            """,
+            (uid, product_id, price, int(time.time()))
+        )
+
+        c.commit()
+
+        final_user = c.execute(
+            "SELECT * FROM users WHERE uid=?",
+            (uid,)
+        ).fetchone()
+
+        return {
+            "success": True,
+            "product": product_id,
+            "gram": final_user["gram"],
+            "gems": final_user["gems"],
+            "coins": final_user["coins"],
+            "energy": final_user["energy"],
+            "reward": reward
+        }
+
+    except Exception as e:
+        c.rollback()
+        return {"error": str(e)}
+
+    finally:
+        c.close()
+
+def do_battle(uid, mission):
+    ensure_user(uid)
+
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    energy = user["energy"]
+
+    # Energy: максимум 30, стоимость обычного боя — 3
+    if energy < 3:
+        c.close()
+        return {"error": "Not enough energy"}
+
+    enemy_power = 900 + mission * 420
+
+    owned_power = 0
+
+    rows = c.execute("""
+        SELECT hero_id,count
+        FROM collection
+        WHERE uid=?
+    """, (uid,)).fetchall()
+
+    for row in rows:
+        hero = next(
+            (h for h in HEROES if h["id"] == row["hero_id"]),
+            None
+        )
+
+        if hero:
+            owned_power += hero["power"] * row["count"]
+
+    if owned_power == 0:
+        owned_power = 1000
+
+    win_chance = min(
+        0.9,
+        max(
+            0.25,
+            0.5 + (owned_power - enemy_power) / 10000
+        )
+    )
+
+    win = random.random() < win_chance
+
+    if win:
+        coins_reward = 250 + mission * 75
+        gems_reward = 2 + mission // 2
+        xp_reward = 100 + mission * 25
+    else:
+        coins_reward = 50
+        gems_reward = 0
+        xp_reward = 25
+
+    new_energy = max(0, energy - 3)
+    new_coins = user["coins"] + coins_reward
+    new_gems = user["gems"] + gems_reward
+    new_xp = user["xp"] + xp_reward
+
+    level = user["level"]
+
+    if new_xp >= level * 500:
+        new_xp -= level * 500
+        level += 1
+
+    c.execute("""
+        UPDATE users
+        SET energy=?,coins=?,gems=?,xp=?,level=?,energy_updated=?
+        WHERE uid=?
+    """, (
+        new_energy,
+        new_coins,
+        new_gems,
+        new_xp,
+        level,
+        int(time.time()),
+        uid
+    ))
+
+    c.commit()
+    c.close()
+
+    return {
+        "win": win,
+        "reward": {
+            "coins": coins_reward,
+            "gems": gems_reward,
+            "xp": xp_reward
+        }
+    }
+
+
+def leaderboard():
+    c = db()
+
+    rows = c.execute("""
+        SELECT uid,coins,level
+        FROM users
+        ORDER BY coins DESC
+        LIMIT 50
+    """).fetchall()
+
+    result = []
+
+    for row in rows:
+        result.append({
+            "uid": row["uid"],
+            "coins": row["coins"],
+            "level": row["level"]
+        })
+
+    c.close()
+
+    return result
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    def send_json(self, data, status=200):
+        body = json.dumps(
+            data,
+            ensure_ascii=False
+        ).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        )
+        self.end_headers()
+
+    def read_json(self):
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            raw = self.rfile.read(length)
+
+            return json.loads(
+                raw.decode("utf-8")
+            )
+
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/")
+
+        if path == "/api/heroes":
+            self.send_json(HEROES)
+            return
+
+        if path == "/api/shop":
+            self.send_json({
+                "products": get_shop()
+            })
+            return
+
+        if path == "/api/payment/packages":
+            self.send_json({
+                "packages": [
+                    {
+                        "gram": amount,
+                        "ton": data["ton"],
+                        "usdt": data["usdt"]
+                    }
+                    for amount, data in GRAM_PACKAGES.items()
+                ],
+                "addresses": PAYMENT_ADDRESSES
+            })
+            return
+
+        if path.startswith("/api/state/"):
+            try:
+                uid = int(
+                    path.split("/")[-1]
+                )
+
+                self.send_json(
+                    get_state(uid)
+                )
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        if path == "/api/leaderboard":
+            self.send_json(
+                leaderboard()
+            )
+            return
+
+        if path == "":
+            self.send_json({
+                "status": "online",
+                "name": "Neon Heroes API"
+            })
+            return
+
+        self.send_json(
+            {"error": "Not found"},
+            404
+        )
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/")
+
+        data = self.read_json()
+
+        if path == "/api/payment/create":
+            try:
+                data = json.loads(
+                    self.rfile.read(
+                        int(self.headers.get("Content-Length", 0))
+                    ).decode("utf-8")
+                )
+
+                uid = int(data.get("uid"))
+                network = str(data.get("network"))
+                gram = int(data.get("gram"))
+
+                result = create_payment_order(
+                    uid,
+                    network,
+                    gram
+                )
+
+                self.send_json(
+                    result,
+                    400 if "error" in result else 200
+                )
+
+            except Exception as e:
+                self.send_json({
+                    "error": str(e)
+                }, 400)
+
+            return
+
+        if path == "/api/payment/status":
+            try:
+                data = json.loads(
+                    self.rfile.read(
+                        int(self.headers.get("Content-Length", 0))
+                    ).decode("utf-8")
+                )
+
+                uid = int(data.get("uid"))
+                order_id = int(data.get("order_id"))
+
+                result = get_payment_order(
+                    uid,
+                    order_id
+                )
+
+                self.send_json(
+                    result,
+                    400 if "error" in result else 200
+                )
+
+            except Exception as e:
+                self.send_json({
+                    "error": str(e)
+                }, 400)
+
+            return
+
+        if path == "/api/shop/purchase":
+            try:
+                data = json.loads(
+                    self.rfile.read(
+                        int(self.headers.get("Content-Length", 0))
+                    ).decode("utf-8")
+                )
+
+                uid = int(data.get("uid"))
+                product_id = str(data.get("product_id"))
+
+                result = purchase_product(
+                    uid,
+                    product_id
+                )
+
+                if "error" in result:
+                    self.send_json(
+                        result,
+                        400
+                    )
+                else:
+                    self.send_json(result)
+
+            except Exception as e:
+                self.send_json({
+                    "error": str(e)
+                }, 400)
+
+            return
+
+        if path == "/api/chest/open":
+            try:
+                uid = int(data["uid"])
+                chest = str(data["chest"])
+
+                result = open_chest(
+                    uid,
+                    chest
+                )
+
+                if "error" in result:
+                    self.send_json(
+                        result,
+                        400
+                    )
+                else:
+                    self.send_json(result)
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        if path == "/api/battle":
+            try:
+                uid = int(data["uid"])
+                mission = int(
+                    data.get("mission", 1)
+                )
+
+                result = do_battle(
+                    uid,
+                    mission
+                )
+
+                if "error" in result:
+                    self.send_json(
+                        result,
+                        400
+                    )
+                else:
+                    self.send_json(result)
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        self.send_json(
+            {"error": "Not found"},
+            404
+        )
+
+
+def main():
+    host = "0.0.0.0"
+    port = 8000
+
+    print("")
+    print("==============================")
+    print("       NEON HEROES API")
+    print("==============================")
+    print(f"Server: http://127.0.0.1:{port}")
+    print("Status: ONLINE")
+    print("Press CTRL+C to stop")
+    print("==============================")
+    print("")
+
+    server = ThreadingHTTPServer(
+        (host, port),
+        Handler
+    )
+
+    try:
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

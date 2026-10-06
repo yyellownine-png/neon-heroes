@@ -1,0 +1,53 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pathlib import Path
+import sqlite3, random, time
+BASE=Path(__file__).resolve().parent; DB=BASE/'game.db'
+app=FastAPI(title='Neon Heroes API',version='1.0')
+app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
+H=[
+{"id":"viktor","name":"Viktor","title":"Wasteland Hunter","rarity":"Legendary","class":"Assault","power":2840,"hp":7920,"atk":2840,"def":1480,"ability":"Deadshot","level":1,"image":"assets/heroes/viktor.svg"},
+{"id":"nyx","name":"Nyx","title":"Shadow Operative","rarity":"Epic","class":"Control","power":2190,"hp":5140,"atk":2310,"def":920,"ability":"Void Trap","level":1,"image":"assets/heroes/nyx.svg"},
+{"id":"mara","name":"Mara","title":"Field Medic","rarity":"Rare","class":"Support","power":1540,"hp":4380,"atk":1260,"def":810,"ability":"Emergency Pulse","level":1,"image":"assets/heroes/mara.svg"},
+{"id":"raven","name":"Raven","title":"Deadeye","rarity":"Legendary","class":"Sniper","power":3010,"hp":6020,"atk":3220,"def":760,"ability":"Blackout Shot","level":1,"image":"assets/heroes/raven.svg"},
+{"id":"kael","name":"Kael","title":"Iron Vanguard","rarity":"Epic","class":"Tank","power":2380,"hp":9100,"atk":1780,"def":2210,"ability":"Iron Wall","level":1,"image":"assets/heroes/kael.svg"},
+{"id":"sable","name":"Sable","title":"Void Runner","rarity":"Rare","class":"Assault","power":1710,"hp":4700,"atk":1930,"def":850,"ability":"Phase Strike","level":1,"image":"assets/heroes/sable.svg"},
+{"id":"iris","name":"Iris","title":"Neon Oracle","rarity":"Epic","class":"Support","power":2240,"hp":5900,"atk":2050,"def":1100,"ability":"Overclock","level":1,"image":"assets/heroes/iris.svg"},
+{"id":"jax","name":"Jax","title":"Riot Breaker","rarity":"Rare","class":"Tank","power":1600,"hp":7600,"atk":1510,"def":1880,"ability":"Shockwave","level":1,"image":"assets/heroes/jax.svg"}]
+CHESTS={"Basic":3,"Rare":7,"Epic":15,"Legendary":30}
+def conn():
+ c=sqlite3.connect(DB); c.execute('CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,gems INTEGER DEFAULT 100,coins INTEGER DEFAULT 5000,energy INTEGER DEFAULT 100,level INTEGER DEFAULT 1,xp INTEGER DEFAULT 0,language TEXT DEFAULT "en",created INTEGER)'); c.execute('CREATE TABLE IF NOT EXISTS collection(uid INTEGER,hero TEXT,level INTEGER DEFAULT 1,PRIMARY KEY(uid,hero))'); c.commit(); return c
+def ensure(uid):
+ c=conn(); c.execute('INSERT OR IGNORE INTO users(id,created) VALUES(?,?)',(uid,int(time.time()))); c.commit(); return c
+@app.get('/api/heroes')
+def heroes(): return H
+@app.get('/api/state/{uid}')
+def state(uid:int):
+ c=ensure(uid); u=c.execute('SELECT gems,coins,energy,level,xp,language FROM users WHERE id=?',(uid,)).fetchone(); owned=[r[0] for r in c.execute('SELECT hero FROM collection WHERE uid=?',(uid,))]; c.close(); return dict(gems=u[0],coins=u[1],energy=u[2],level=u[3],xp=u[4],language=u[5],owned=owned)
+class Chest(BaseModel): uid:int; chest:str
+@app.post('/api/chest/open')
+def chest(x:Chest):
+ if x.chest not in CHESTS:return {'error':'Unknown chest'}
+ c=ensure(x.uid); gems=c.execute('SELECT gems FROM users WHERE id=?',(x.uid,)).fetchone()[0]; price=CHESTS[x.chest]
+ if gems<price:c.close();return {'error':'Not enough Gems'}
+ weights={'Basic':[('Rare',78),('Epic',20),('Legendary',2)],'Rare':[('Rare',55),('Epic',38),('Legendary',7)],'Epic':[('Rare',20),('Epic',60),('Legendary',20)],'Legendary':[('Epic',20),('Legendary',74),('Limited Legendary',6)]}[x.chest]
+ n=random.random()*100; acc=0; rarity='Rare'
+ for rr,w in weights:
+  acc+=w
+  if n<=acc:rarity=rr;break
+ pool=[h for h in H if h['rarity']==rarity]
+ if not pool:pool=[h for h in H if h['rarity']=='Legendary']
+ hero=random.choice(pool); c.execute('UPDATE users SET gems=gems-? WHERE id=?',(price,x.uid)); c.execute('INSERT OR IGNORE INTO collection(uid,hero) VALUES(?,?)',(x.uid,hero['id']));c.commit();g=c.execute('SELECT gems FROM users WHERE id=?',(x.uid,)).fetchone()[0];c.close();return {'hero':hero,'rarity':rarity,'gems':g}
+class Battle(BaseModel):uid:int; mission:int
+@app.post('/api/battle')
+def battle(x:Battle):
+ c=ensure(x.uid); row=c.execute('SELECT energy,gems,coins,xp FROM users WHERE id=?',(x.uid,)).fetchone();
+ if row[0]<10:c.close();return {'error':'Not enough Energy'}
+ power=900+x.mission*420; player=2200+x.mission*260+random.randint(-300,500); win=player>=power or random.random()<.72
+ if win:
+  gems=random.randint(1,5);coins=350+x.mission*80;xp=100+x.mission*25;c.execute('UPDATE users SET energy=energy-10,gems=gems+?,coins=coins+?,xp=xp+? WHERE id=?',(gems,coins,xp,x.uid))
+ else:gems=0;coins=60;xp=25;c.execute('UPDATE users SET energy=energy-10,coins=coins+?,xp=xp+? WHERE id=?',(coins,xp,x.uid))
+ c.commit();c.close();return {'win':win,'enemyPower':power,'reward':{'gems':gems,'coins':coins,'xp':xp}}
+@app.get('/api/leaderboard')
+def leaderboard():return [{'rank':1,'name':'RavenX','power':48210},{'rank':2,'name':'NEXUS','power':45120},{'rank':3,'name':'Viktor_7','power':43890},{'rank':4,'name':'SABLE','power':40210}]

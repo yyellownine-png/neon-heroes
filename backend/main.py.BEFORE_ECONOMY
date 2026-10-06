@@ -1,0 +1,611 @@
+import json
+import random
+import sqlite3
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+BASE_DIR = Path(__file__).resolve().parent
+DB = BASE_DIR / "game.db"
+
+HEROES = [
+    {
+        "id": 1,
+        "name": "Viktor",
+        "rarity": "Common",
+        "class": "Tank",
+        "power": 920,
+        "hp": 1400,
+        "atk": 180,
+        "def": 240,
+        "title": "The Iron Guardian",
+        "ability": "IRON WALL",
+        "image": "assets/viktor.jpg"
+    },
+    {
+        "id": 2,
+        "name": "Nyx",
+        "rarity": "Rare",
+        "class": "Assassin",
+        "power": 1350,
+        "hp": 950,
+        "atk": 320,
+        "def": 120,
+        "title": "Shadow of the Night",
+        "ability": "NIGHT STRIKE",
+        "image": "assets/nyx.jpg"
+    },
+    {
+        "id": 3,
+        "name": "Mara",
+        "rarity": "Rare",
+        "class": "Mage",
+        "power": 1480,
+        "hp": 1050,
+        "atk": 390,
+        "def": 100,
+        "title": "Neon Witch",
+        "ability": "VOID BLAST",
+        "image": "assets/mara.jpg"
+    },
+    {
+        "id": 4,
+        "name": "Raven",
+        "rarity": "Epic",
+        "class": "Assassin",
+        "power": 2100,
+        "hp": 1250,
+        "atk": 560,
+        "def": 180,
+        "title": "Cyber Phantom",
+        "ability": "RAVEN FURY",
+        "image": "assets/raven.jpg"
+    },
+    {
+        "id": 5,
+        "name": "Kael",
+        "rarity": "Epic",
+        "class": "Warrior",
+        "power": 2250,
+        "hp": 1850,
+        "atk": 480,
+        "def": 360,
+        "title": "Last Vanguard",
+        "ability": "OVERDRIVE",
+        "image": "assets/kael.jpg"
+    },
+    {
+        "id": 6,
+        "name": "Sable",
+        "rarity": "Legendary",
+        "class": "Assassin",
+        "power": 3200,
+        "hp": 1500,
+        "atk": 780,
+        "def": 240,
+        "title": "Queen of Shadows",
+        "ability": "VOID EXECUTION",
+        "image": "assets/sable.jpg"
+    },
+    {
+        "id": 7,
+        "name": "Iris",
+        "rarity": "Legendary",
+        "class": "Support",
+        "power": 3050,
+        "hp": 2200,
+        "atk": 520,
+        "def": 420,
+        "title": "Neon Oracle",
+        "ability": "STARLIGHT",
+        "image": "assets/iris.jpg"
+    },
+    {
+        "id": 8,
+        "name": "Jax",
+        "rarity": "Common",
+        "class": "Warrior",
+        "power": 980,
+        "hp": 1350,
+        "atk": 210,
+        "def": 220,
+        "title": "Street Fighter",
+        "ability": "POWER PUNCH",
+        "image": "assets/jax.jpg"
+    }
+]
+
+CHESTS = {
+    "Basic": 3,
+    "Rare": 7,
+    "Epic": 15,
+    "Legendary": 30
+}
+
+
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            uid INTEGER PRIMARY KEY,
+            gems INTEGER DEFAULT 100,
+            coins INTEGER DEFAULT 5000,
+            energy INTEGER DEFAULT 100,
+            level INTEGER DEFAULT 1,
+            xp INTEGER DEFAULT 0
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS collection (
+            uid INTEGER,
+            hero_id INTEGER,
+            count INTEGER DEFAULT 1,
+            PRIMARY KEY(uid, hero_id)
+        )
+    """)
+
+    c.commit()
+    return c
+
+
+def ensure_user(uid):
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    if not user:
+        c.execute("""
+            INSERT INTO users(uid,gems,coins,energy,level,xp)
+            VALUES(?,?,?,?,?,?)
+        """, (uid, 100, 5000, 100, 1, 0))
+        c.commit()
+
+    c.close()
+
+
+def get_state(uid):
+    ensure_user(uid)
+
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    collection = c.execute(
+        "SELECT hero_id,count FROM collection WHERE uid=?",
+        (uid,)
+    ).fetchall()
+
+    owned = []
+
+    for row in collection:
+        owned.append({
+            "hero_id": row["hero_id"],
+            "count": row["count"]
+        })
+
+    result = {
+        "uid": uid,
+        "gems": user["gems"],
+        "coins": user["coins"],
+        "energy": user["energy"],
+        "level": user["level"],
+        "xp": user["xp"],
+        "owned": owned
+    }
+
+    c.close()
+
+    return result
+
+
+def open_chest(uid, chest):
+    if chest not in CHESTS:
+        return {"error": "Unknown chest"}
+
+    ensure_user(uid)
+
+    cost = CHESTS[chest]
+
+    c = db()
+
+    user = c.execute(
+        "SELECT gems FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    gems = user["gems"]
+
+    if gems < cost:
+        c.close()
+        return {"error": "Not enough gems"}
+
+    odds = {
+        "Basic": ["Common", "Common", "Rare"],
+        "Rare": ["Common", "Rare", "Rare", "Epic"],
+        "Epic": ["Rare", "Epic", "Epic", "Legendary"],
+        "Legendary": ["Epic", "Legendary", "Legendary", "Limited Legendary"]
+    }
+
+    rarity = random.choice(odds[chest])
+
+    pool = [
+        h for h in HEROES
+        if h["rarity"] == rarity
+    ]
+
+    if not pool:
+        pool = [
+            h for h in HEROES
+            if h["rarity"] == "Legendary"
+        ]
+
+    hero = random.choice(pool)
+
+    new_gems = gems - cost
+
+    c.execute(
+        "UPDATE users SET gems=? WHERE uid=?",
+        (new_gems, uid)
+    )
+
+    old = c.execute("""
+        SELECT count
+        FROM collection
+        WHERE uid=? AND hero_id=?
+    """, (uid, hero["id"])).fetchone()
+
+    if old:
+        c.execute("""
+            UPDATE collection
+            SET count=count+1
+            WHERE uid=? AND hero_id=?
+        """, (uid, hero["id"]))
+    else:
+        c.execute("""
+            INSERT INTO collection(uid,hero_id,count)
+            VALUES(?,?,1)
+        """, (uid, hero["id"], 1))
+
+    c.commit()
+    c.close()
+
+    return {
+        "hero": hero,
+        "rarity": rarity,
+        "gems": new_gems
+    }
+
+
+def do_battle(uid, mission):
+    ensure_user(uid)
+
+    c = db()
+
+    user = c.execute(
+        "SELECT * FROM users WHERE uid=?",
+        (uid,)
+    ).fetchone()
+
+    energy = user["energy"]
+
+    if energy < 10:
+        c.close()
+        return {"error": "Not enough energy"}
+
+    enemy_power = 900 + mission * 420
+
+    owned_power = 0
+
+    rows = c.execute("""
+        SELECT hero_id,count
+        FROM collection
+        WHERE uid=?
+    """, (uid,)).fetchall()
+
+    for row in rows:
+        hero = next(
+            (h for h in HEROES if h["id"] == row["hero_id"]),
+            None
+        )
+
+        if hero:
+            owned_power += hero["power"] * row["count"]
+
+    if owned_power == 0:
+        owned_power = 1000
+
+    win_chance = min(
+        0.9,
+        max(
+            0.25,
+            0.5 + (owned_power - enemy_power) / 10000
+        )
+    )
+
+    win = random.random() < win_chance
+
+    if win:
+        coins_reward = 250 + mission * 75
+        gems_reward = 2 + mission // 2
+        xp_reward = 100 + mission * 25
+    else:
+        coins_reward = 50
+        gems_reward = 0
+        xp_reward = 25
+
+    new_energy = energy - 10
+    new_coins = user["coins"] + coins_reward
+    new_gems = user["gems"] + gems_reward
+    new_xp = user["xp"] + xp_reward
+
+    level = user["level"]
+
+    if new_xp >= level * 500:
+        new_xp -= level * 500
+        level += 1
+
+    c.execute("""
+        UPDATE users
+        SET energy=?,coins=?,gems=?,xp=?,level=?
+        WHERE uid=?
+    """, (
+        new_energy,
+        new_coins,
+        new_gems,
+        new_xp,
+        level,
+        uid
+    ))
+
+    c.commit()
+    c.close()
+
+    return {
+        "win": win,
+        "reward": {
+            "coins": coins_reward,
+            "gems": gems_reward,
+            "xp": xp_reward
+        }
+    }
+
+
+def leaderboard():
+    c = db()
+
+    rows = c.execute("""
+        SELECT uid,coins,level
+        FROM users
+        ORDER BY coins DESC
+        LIMIT 50
+    """).fetchall()
+
+    result = []
+
+    for row in rows:
+        result.append({
+            "uid": row["uid"],
+            "coins": row["coins"],
+            "level": row["level"]
+        })
+
+    c.close()
+
+    return result
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    def send_json(self, data, status=200):
+        body = json.dumps(
+            data,
+            ensure_ascii=False
+        ).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body))
+        )
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type"
+        )
+        self.end_headers()
+
+    def read_json(self):
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    0
+                )
+            )
+
+            raw = self.rfile.read(length)
+
+            return json.loads(
+                raw.decode("utf-8")
+            )
+
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/")
+
+        if path == "/api/heroes":
+            self.send_json(HEROES)
+            return
+
+        if path.startswith("/api/state/"):
+            try:
+                uid = int(
+                    path.split("/")[-1]
+                )
+
+                self.send_json(
+                    get_state(uid)
+                )
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        if path == "/api/leaderboard":
+            self.send_json(
+                leaderboard()
+            )
+            return
+
+        if path == "":
+            self.send_json({
+                "status": "online",
+                "name": "Neon Heroes API"
+            })
+            return
+
+        self.send_json(
+            {"error": "Not found"},
+            404
+        )
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/")
+
+        data = self.read_json()
+
+        if path == "/api/chest/open":
+            try:
+                uid = int(data["uid"])
+                chest = str(data["chest"])
+
+                result = open_chest(
+                    uid,
+                    chest
+                )
+
+                if "error" in result:
+                    self.send_json(
+                        result,
+                        400
+                    )
+                else:
+                    self.send_json(result)
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        if path == "/api/battle":
+            try:
+                uid = int(data["uid"])
+                mission = int(
+                    data.get("mission", 1)
+                )
+
+                result = do_battle(
+                    uid,
+                    mission
+                )
+
+                if "error" in result:
+                    self.send_json(
+                        result,
+                        400
+                    )
+                else:
+                    self.send_json(result)
+
+            except Exception as e:
+                self.send_json(
+                    {"error": str(e)},
+                    400
+                )
+
+            return
+
+        self.send_json(
+            {"error": "Not found"},
+            404
+        )
+
+
+def main():
+    host = "0.0.0.0"
+    port = 8000
+
+    print("")
+    print("==============================")
+    print("       NEON HEROES API")
+    print("==============================")
+    print(f"Server: http://127.0.0.1:{port}")
+    print("Status: ONLINE")
+    print("Press CTRL+C to stop")
+    print("==============================")
+    print("")
+
+    server = ThreadingHTTPServer(
+        (host, port),
+        Handler
+    )
+
+    try:
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
