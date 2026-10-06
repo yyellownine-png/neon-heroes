@@ -1,4 +1,4 @@
-const API = 'https://737c6f7eb3d59c.lhr.life/api';
+const API = '/api';
 const UID = 1040432061;
 
 let heroes = [];
